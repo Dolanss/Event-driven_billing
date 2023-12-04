@@ -1,0 +1,14 @@
+spring:
+  jpa:
+    show-sql: true
+  flyway:
+    clean-disabled: false
+
+webhook:
+  security:
+    username: stripe-provider
+    password: super-secret-key
+
+logging:
+  level:
+    com.billing.webhook: DEBUG
