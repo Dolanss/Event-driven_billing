@@ -1,0 +1,1 @@
+- fix: prevent duplicate invoice update on concurrent redelivery in InvoiceService
