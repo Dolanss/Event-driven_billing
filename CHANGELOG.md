@@ -1,1 +1,2 @@
 - fix: prevent duplicate invoice update on concurrent redelivery in InvoiceService
+- fix: stop retrying dead-letter events after max attempts in RetrySchedulerService
