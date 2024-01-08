@@ -1,3 +1,4 @@
 - fix: prevent duplicate invoice update on concurrent redelivery in InvoiceService
 - fix: stop retrying dead-letter events after max attempts in RetrySchedulerService
 - refactor: extract payment event routing to dedicated method in WebhookProcessingService
+- fix: tune exponential backoff intervals (10s/20s/40s) after load testing
