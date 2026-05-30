@@ -1,220 +1,377 @@
 # Billing Webhook Processor
 
-Event-driven billing webhook processor built with **Java 17 + Spring Boot 3**. Handles payment events (PAID, FAILED, REFUNDED, CHARGEBACK) with idempotency, async processing, invoice state machine, retry logic, audit logging and Prometheus metrics.
+[![CI](https://github.com/Dolanss/Event-driven_billing/actions/workflows/ci.yml/badge.svg)](https://github.com/Dolanss/Event-driven_billing/actions/workflows/ci.yml)
+
+Backend service for processing payment webhooks with idempotent ingestion, asynchronous execution, invoice state transitions, retry/backoff, audit logging, PostgreSQL migrations and Prometheus-compatible metrics.
+
+The project models a common billing problem: external payment providers can deliver events more than once, deliver them late, or fail during delivery. The service keeps a durable record of every received event, applies business rules through a controlled invoice state machine and exposes enough operational signals to reason about failures.
+
+## Why This Project Exists
+
+Webhook processing is deceptively simple at small scale and easy to get wrong in production. A robust implementation needs to handle duplicate delivery, transient failures, invalid state transitions, auditability, monitoring and safe retries.
+
+This repository focuses on those backend engineering concerns rather than on CRUD screens:
+
+- Receive payment events from an external provider.
+- Persist each event before asynchronous processing.
+- Prevent duplicate processing through a database uniqueness constraint.
+- Apply invoice state changes inside a transaction.
+- Store audit history for every invoice transition.
+- Retry transient failures and isolate non-processable events.
+- Expose health and metrics endpoints for operations.
 
 ## Architecture
 
-```
-POST /webhooks/payment
-       │
-       ▼
-WebhookIngestionService          ← idempotency check (event_id UNIQUE in DB)
-       │  persists WebhookEvent
-       ▼
-  EventQueue (BlockingQueue)     ← simulates RabbitMQ exchange
-       │
-       ▼
-EventQueueConsumer (virtual thread)
-       │
-       ▼
-WebhookProcessingService         ← @Transactional
-       ├── InvoiceService        ← state machine + upsert invoice
-       │       └── AuditService  ← same transaction (MANDATORY propagation)
-       └── on failure → exponential backoff (10s / 20s / 40s)
-
-RetrySchedulerService            ← @Scheduled every 10s, re-queues FAILED events
+```mermaid
+flowchart LR
+    Provider[Payment Provider] --> API[WebhookController]
+    API --> Ingestion[WebhookIngestionService]
+    Ingestion --> Events[(webhook_events)]
+    Ingestion --> Queue[In-memory EventQueue]
+    Queue --> Consumer[EventQueueConsumer]
+    Consumer --> Processor[WebhookProcessingService]
+    Processor --> Invoice[InvoiceService]
+    Invoice --> Invoices[(invoices)]
+    Invoice --> Audit[AuditService]
+    Audit --> Logs[(audit_logs)]
+    Processor --> Metrics[Micrometer / Prometheus]
 ```
 
-## Features
+The local implementation uses an in-memory bounded queue to keep the project easy to run. In a production deployment, this component should be replaced with a durable broker such as RabbitMQ, Amazon SQS or Kafka, usually with a transactional outbox between PostgreSQL and the broker.
 
-| Feature | Details |
-|---|---|
-| **Idempotency** | `event_id` unique constraint — `HTTP 409` on duplicate |
-| **Async processing** | `LinkedBlockingQueue<1000>` + virtual-thread consumer (drop-in for RabbitMQ) |
-| **Invoice state machine** | `PENDING → PAID / FAILED / REFUNDED / CHARGEBACK` — terminal states are immutable |
-| **Retry logic** | Exponential backoff: 10s → 20s → 40s, max 3 attempts → `DEAD_LETTER` |
-| **Audit log** | Every status transition recorded atomically in the same transaction |
-| **Security** | HTTP Basic Auth via Spring Security (simulate provider secret) |
-| **Migrations** | Flyway with 3 versioned SQL scripts |
-| **Metrics** | Prometheus counters per event type/result + queue size gauge |
-| **Observability** | Spring Actuator: `/health`, `/metrics`, `/prometheus` |
+## Processing Flow
+
+```mermaid
+sequenceDiagram
+    participant P as Payment Provider
+    participant C as Webhook API
+    participant I as Ingestion Service
+    participant D as PostgreSQL
+    participant Q as Event Queue
+    participant W as Worker
+    participant S as Invoice Service
+
+    P->>C: POST /webhooks/payment
+    C->>I: validate request
+    I->>D: insert webhook event
+    I-->>Q: publish after DB commit
+    C-->>P: 202 Accepted
+    W->>Q: consume event
+    W->>D: mark event PROCESSING
+    W->>S: apply invoice transition
+    S->>D: update invoice and audit log
+    W->>D: mark event PROCESSED
+```
+
+## Invoice State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> PAID
+    PENDING --> FAILED
+    FAILED --> PAID: payment retry succeeds
+    PAID --> REFUNDED
+    PAID --> CHARGEBACK
+    REFUNDED --> [*]
+    CHARGEBACK --> [*]
+```
+
+Invalid transitions are treated as business rule violations and moved to `DEAD_LETTER` instead of being retried.
+
+## Retry Flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> RECEIVED
+    RECEIVED --> PROCESSING
+    PROCESSING --> PROCESSED
+    PROCESSING --> FAILED: retryable failure
+    FAILED --> RECEIVED: next_retry_at reached
+    FAILED --> DEAD_LETTER: max attempts reached
+    PROCESSING --> DEAD_LETTER: invalid transition
+```
 
 ## Tech Stack
 
-- **Java 17** — virtual threads for the queue consumer
-- **Spring Boot 3.2** — Web, Data JPA, Security, Actuator, Validation
-- **PostgreSQL 16** — primary store
-- **Flyway** — schema migrations
-- **Micrometer + Prometheus** — metrics
-- **Testcontainers** — integration tests against a real Postgres instance
-- **Awaitility** — async assertion helper in tests
-- **Docker Compose** — local environment
+- Java 21
+- Spring Boot 3.2
+- Spring Web, Data JPA, Security, Validation and Actuator
+- PostgreSQL 16
+- Flyway
+- Micrometer and Prometheus registry
+- Docker and Docker Compose
+- JUnit, Mockito, Awaitility and Testcontainers
+- GitHub Actions
 
-## Project Structure
+## Features
 
+| Area | Implementation |
+|---|---|
+| Webhook ingestion | `POST /webhooks/payment` returns `202 Accepted` after validation and persistence |
+| Idempotency | `event_id` is protected by a unique database constraint |
+| Transaction safety | Queue publication is scheduled after the event insert commits |
+| Async processing | Bounded in-memory queue and virtual-thread consumer |
+| Business rules | Invoice state machine blocks invalid transitions |
+| Auditability | Invoice transitions are recorded in `audit_logs` in the same transaction |
+| Retry | Exponential backoff with a max retry count |
+| Dead-letter | Non-processable events are marked as `DEAD_LETTER` |
+| Persistence | PostgreSQL schema managed by Flyway |
+| Observability | Actuator health endpoint and Prometheus metrics |
+| Quality | Unit and integration tests with Testcontainers |
+
+## Technical Decisions
+
+### Idempotency
+
+The service relies on a unique constraint in PostgreSQL for `event_id`. This is stronger than an application-only pre-check because concurrent requests can race. Duplicate inserts are handled as conflicts and returned as `409 Conflict`.
+
+### Transaction Boundaries
+
+The invoice update and audit log insert happen in the same transaction. This keeps the current invoice state and its historical trail consistent.
+
+Webhook events are published to the local queue after the database transaction commits. That avoids workers attempting to process an event that has not yet become visible in PostgreSQL.
+
+### Optimistic Locking
+
+Invoices include a version column for optimistic locking. This protects state transitions from lost updates when multiple events for the same invoice are processed concurrently.
+
+### Retry Semantics
+
+The service separates retryable technical failures from permanent business failures. Invalid invoice transitions are not retried because retrying would not change the business rule outcome.
+
+## Trade-offs and Known Limitations
+
+- The queue is in-memory and not durable. Restarting the application can lose queued-but-not-yet-processed messages.
+- The service does not implement a transactional outbox yet.
+- Queue publication after commit improves transaction visibility but still needs a recovery mechanism for events persisted and not queued due to local queue saturation.
+- Basic Auth is used for local simplicity. Real payment webhooks should use signed payloads with timestamp validation and replay protection.
+- The current design is a single-service deployment. Horizontal scaling requires replacing the local queue with a broker and coordinating message ownership.
+- Metrics cover the core processing flow, but production deployments would need stronger SLO-oriented dashboards.
+
+## Production Evolution
+
+The next production-grade step would be:
+
+```mermaid
+flowchart LR
+    API[Webhook API] --> DB[(PostgreSQL)]
+    DB --> Outbox[(outbox table)]
+    Relay[Outbox Relay] --> Broker[Durable Broker]
+    Broker --> Workers[Webhook Workers]
+    Workers --> DB
+    Broker --> DLQ[Dead-letter Queue]
+    Workers --> Metrics[Metrics / Logs / Traces]
 ```
-src/main/java/com/billing/webhook/
-├── config/          # Async, Security, Jackson, Metrics
-├── controller/      # WebhookController, InvoiceController
-├── domain/          # Invoice, WebhookEvent, AuditLog (entities + enums)
-├── dto/             # PaymentEventRequest, WebhookResponse, ErrorResponse
-├── exception/       # Domain exceptions + GlobalExceptionHandler
-├── queue/           # EventQueue, EventQueueConsumer, WebhookEventMessage
-├── repository/      # Spring Data JPA repositories
-└── service/         # WebhookIngestionService, WebhookProcessingService,
-                     # InvoiceService, AuditService, RetrySchedulerService
 
-src/main/resources/
-├── application.yml
-└── db/migration/
-    ├── V1__create_invoices.sql
-    ├── V2__create_webhook_events.sql
-    └── V3__create_audit_logs.sql
-```
+Recommended improvements:
 
-## Running Locally
-
-### With Docker Compose
-
-```bash
-docker-compose up --build
-```
-
-The API will be available at `http://localhost:8080`.
-
-### Without Docker (requires a local Postgres)
-
-```bash
-# Set environment variables
-export DB_HOST=localhost
-export DB_NAME=webhookdb
-export DB_USER=webhookuser
-export DB_PASSWORD=webhookpass
-
-mvn spring-boot:run
-```
+- Transactional outbox for reliable event publication.
+- Durable broker with acknowledgements, redelivery and DLQ.
+- HMAC webhook signature validation.
+- Structured JSON logs with `eventId`, `invoiceId`, `eventType` and `attempt`.
+- Distributed tracing if the worker and API are split.
+- Recovery job for stale `RECEIVED` or `PROCESSING` events.
+- Load tests for queue saturation, DB pool pressure and retry behavior.
 
 ## API
 
 ### Authentication
 
-All endpoints use HTTP Basic Auth. Default credentials (override via env vars):
+All application endpoints require HTTP Basic authentication, except selected Actuator endpoints.
+
+Default local credentials:
 
 | Variable | Default |
 |---|---|
 | `WEBHOOK_USERNAME` | `stripe-provider` |
 | `WEBHOOK_PASSWORD` | `super-secret-key` |
 
-### Endpoints
+### Receive Payment Event
 
-#### `POST /webhooks/payment`
-Receives a payment event.
+```http
+POST /webhooks/payment
+Authorization: Basic base64(username:password)
+Content-Type: application/json
+```
 
-**Request body:**
 ```json
 {
-  "eventId":    "evt_001",
-  "invoiceId":  "INV-2024-001",
-  "eventType":  "PAID",
-  "amount":     149.99,
-  "currency":   "BRL",
+  "eventId": "evt_001",
+  "invoiceId": "INV-2026-001",
+  "eventType": "PAID",
+  "amount": 149.99,
+  "currency": "BRL",
   "customerId": "cust-abc",
-  "metadata":   null
+  "metadata": null
 }
 ```
 
-**Event types:** `PAID` | `FAILED` | `REFUNDED` | `CHARGEBACK`
+Supported event types:
 
-**Responses:**
+- `PAID`
+- `FAILED`
+- `REFUNDED`
+- `CHARGEBACK`
+
+Responses:
 
 | Status | Meaning |
 |---|---|
-| `202 Accepted` | Event queued for async processing |
-| `409 Conflict` | Duplicate `eventId` |
-| `400 Bad Request` | Validation error |
+| `202 Accepted` | Event persisted and accepted for asynchronous processing |
+| `400 Bad Request` | Invalid request body |
 | `401 Unauthorized` | Missing or invalid credentials |
+| `409 Conflict` | Duplicate `eventId` |
 
-#### `GET /webhooks/payment/{invoiceId}/audit`
-Returns the full status transition history for an invoice, ordered by time.
+Business validation that depends on the current invoice state happens asynchronously. Invalid state transitions are recorded on the webhook event and moved to `DEAD_LETTER`.
 
-#### `GET /invoices/{externalId}`
-Returns the current state of an invoice.
+### Other Endpoints
 
-#### `GET /actuator/health`
-Public. Returns application and DB health.
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/invoices/{externalId}` | Returns current invoice state |
+| `GET` | `/webhooks/payment/{invoiceId}/audit` | Returns invoice transition history |
+| `GET` | `/actuator/health` | Health check |
+| `GET` | `/actuator/prometheus` | Prometheus metrics |
 
-#### `GET /actuator/prometheus`
-Public. Prometheus-format metrics.
+## Running Locally
 
-### Example — full payment flow
+### Docker Compose
+
+```bash
+docker compose up --build
+```
+
+The API will be available at:
+
+```text
+http://localhost:8080
+```
+
+### Local Java Runtime
+
+Requirements:
+
+- Java 21
+- Maven
+- PostgreSQL 16
+
+```bash
+export DB_HOST=localhost
+export DB_PORT=5432
+export DB_NAME=webhookdb
+export DB_USER=webhookuser
+export DB_PASSWORD=webhookpass
+export WEBHOOK_USERNAME=stripe-provider
+export WEBHOOK_PASSWORD=super-secret-key
+
+mvn spring-boot:run
+```
+
+## Example Requests
 
 ```bash
 BASE="http://localhost:8080"
 AUTH="-u stripe-provider:super-secret-key"
 
-# 1. Receive payment
-curl $AUTH -s -X POST $BASE/webhooks/payment \
+curl $AUTH -s -X POST "$BASE/webhooks/payment" \
   -H "Content-Type: application/json" \
-  -d '{"eventId":"evt-1","invoiceId":"INV-001","eventType":"PAID","amount":99.90,"currency":"BRL","customerId":"cust-1"}'
+  -d '{
+    "eventId":"evt-1",
+    "invoiceId":"INV-001",
+    "eventType":"PAID",
+    "amount":99.90,
+    "currency":"BRL",
+    "customerId":"cust-1"
+  }'
 
-# 2. Refund
-curl $AUTH -s -X POST $BASE/webhooks/payment \
-  -H "Content-Type: application/json" \
-  -d '{"eventId":"evt-2","invoiceId":"INV-001","eventType":"REFUNDED","amount":99.90,"currency":"BRL","customerId":"cust-1"}'
+curl $AUTH -s "$BASE/invoices/INV-001"
 
-# 3. Check audit log
-curl $AUTH -s $BASE/webhooks/payment/INV-001/audit | jq .
-
-# 4. Duplicate — should return 409
-curl $AUTH -s -X POST $BASE/webhooks/payment \
-  -H "Content-Type: application/json" \
-  -d '{"eventId":"evt-1","invoiceId":"INV-001","eventType":"PAID","amount":99.90,"currency":"BRL","customerId":"cust-1"}'
+curl $AUTH -s "$BASE/webhooks/payment/INV-001/audit"
 ```
-
-## Invoice State Machine
-
-```
-              PAID ──────────► REFUNDED
-             /    \               (terminal)
-PENDING ────/      └──────────► CHARGEBACK
-            \                    (terminal)
-             └──────────────► FAILED
-                                 │
-                                 └──► PAID  (retry payment)
-```
-
-Attempting an invalid transition returns `HTTP 422 Unprocessable Entity`.
 
 ## Running Tests
 
-Requires Docker (Testcontainers spins up a real Postgres container).
+Integration tests require Docker because Testcontainers starts a real PostgreSQL instance.
 
 ```bash
 mvn test
 ```
 
-Tests cover:
-- Happy path: event accepted, invoice updated, audit recorded
-- Idempotency: duplicate `eventId` returns `409`
-- Unauthenticated request returns `401`
-- Invoice state machine: multi-step transitions + audit trail
-- Audit log endpoint
-- Bean Validation: missing required fields
-- Actuator health is public
-- Unit tests: state machine transitions with Mockito
+The test suite covers:
+
+- Successful webhook ingestion and asynchronous processing
+- Duplicate event rejection
+- Authentication failure
+- Invoice state transitions
+- Audit history endpoint
+- Bean Validation failures
+- Public health endpoint
+- Unit-level state machine behavior
 
 ## Environment Variables
 
+Use `.env.example` as a local reference.
+
 | Variable | Default | Description |
 |---|---|---|
-| `DB_HOST` | `localhost` | Postgres host |
-| `DB_PORT` | `5432` | Postgres port |
+| `DB_HOST` | `localhost` | PostgreSQL host |
+| `DB_PORT` | `5432` | PostgreSQL port |
 | `DB_NAME` | `webhookdb` | Database name |
 | `DB_USER` | `webhookuser` | Database user |
 | `DB_PASSWORD` | `webhookpass` | Database password |
-| `WEBHOOK_USERNAME` | `stripe-provider` | Basic auth username |
-| `WEBHOOK_PASSWORD` | `super-secret-key` | Basic auth password |
-| `SERVER_PORT` | `8080` | HTTP port |
+| `WEBHOOK_USERNAME` | `stripe-provider` | Basic Auth username |
+| `WEBHOOK_PASSWORD` | `super-secret-key` | Basic Auth password |
+| `SERVER_PORT` | `8080` | HTTP server port |
+
+## Repository Structure
+
+```text
+docs/
+|-- architecture.md  # Architecture notes and production evolution
+`-- operations.md    # Metrics, failure scenarios and runbook
+
+src/main/java/com/billing/webhook/
+|-- config/          # Security, Jackson, async and metrics configuration
+|-- controller/      # HTTP endpoints
+|-- domain/          # JPA entities and enums
+|-- dto/             # Request and response models
+|-- exception/       # Domain exceptions and global handler
+|-- queue/           # Local queue abstraction and consumer
+|-- repository/      # Spring Data repositories
+`-- service/         # Ingestion, processing, invoice, retry and audit logic
+
+src/main/resources/
+|-- application.yml
+`-- db/migration/    # Flyway migrations
+```
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Operations](docs/operations.md)
+- [Security Policy](SECURITY.md)
+
+## Operational Signals
+
+Useful signals to watch:
+
+- HTTP request rate and status codes
+- Queue size
+- Event processing success/failure counters
+- Retry count and dead-letter count
+- PostgreSQL connection pool utilization
+- Processing latency and oldest queued event age
+
+## Roadmap
+
+- Replace local queue with RabbitMQ, SQS or Kafka.
+- Add transactional outbox and relay.
+- Add signed webhook verification.
+- Add stale event recovery.
+- Add structured logging and trace correlation.
+- Add load tests for burst traffic and queue saturation.
+- Add operational runbook for retry and dead-letter handling.
 
 ## License
 

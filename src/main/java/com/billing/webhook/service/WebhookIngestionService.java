@@ -12,8 +12,11 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 @Service
 @RequiredArgsConstructor
@@ -26,11 +29,6 @@ public class WebhookIngestionService {
 
     @Transactional
     public WebhookResponse ingest(PaymentEventRequest request) {
-        if (eventRepository.existsByEventId(request.eventId())) {
-            log.warn("Duplicate event received: {}", request.eventId());
-            throw new DuplicateEventException(request.eventId());
-        }
-
         String rawPayload = serialize(request);
 
         WebhookEvent event = WebhookEvent.builder()
@@ -41,12 +39,37 @@ public class WebhookIngestionService {
                 .rawPayload(rawPayload)
                 .retryCount(0)
                 .build();
-        eventRepository.save(event);
 
-        eventQueue.publish(new WebhookEventMessage(request, rawPayload));
-        log.info("Event {} accepted and queued", request.eventId());
+        try {
+            eventRepository.saveAndFlush(event);
+        } catch (DataIntegrityViolationException ex) {
+            log.warn("Duplicate event received: {}", request.eventId());
+            throw new DuplicateEventException(request.eventId());
+        }
+
+        publishAfterCommit(new WebhookEventMessage(request, rawPayload));
+        log.info("Event {} accepted and scheduled for processing", request.eventId());
 
         return WebhookResponse.accepted(request.eventId());
+    }
+
+    private void publishAfterCommit(WebhookEventMessage message) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            eventQueue.publish(message);
+            return;
+        }
+
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                try {
+                    eventQueue.publish(message);
+                } catch (RuntimeException ex) {
+                    log.error("Event {} was persisted but could not be queued: {}",
+                            message.request().eventId(), ex.getMessage());
+                }
+            }
+        });
     }
 
     private String serialize(PaymentEventRequest request) {
